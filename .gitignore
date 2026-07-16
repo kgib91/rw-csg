@@ -1,0 +1,33 @@
+# .NET build and package outputs
+**/[Bb]in/
+**/[Oo]bj/
+**/publish/
+/artifacts/
+TestResults/
+*.nupkg
+*.snupkg
+
+# IDE and user-specific state
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.sln.DotSettings.user
+
+# Local environments and configuration
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+
+# Logs, dumps, and operating-system metadata
+*.log
+*.dmp
+.DS_Store
+Thumbs.db
+Desktop.ini
