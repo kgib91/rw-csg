@@ -53,11 +53,50 @@ public static class SweptBrush
         return best - prof.Epsilon;
     }
 
+    /// <summary>
+    /// Swept brush SDF with the profile axis aligned to an arbitrary signed stock axis.
+    /// The tool tip remains at <paramref name="a"/>/<paramref name="b"/>; only the cutter's
+    /// axial profile direction is transformed.
+    /// </summary>
+    public static float EvalOriented(
+        ToolProfile prof,
+        in Vector3 a,
+        in Vector3 b,
+        ToolAxisDirection axis,
+        in Vector3 point)
+    {
+        Vector3 axisVector = axis.ToVector();
+        float d0 = SampleOriented(prof, a, axisVector, point);
+        Vector3 midpoint = (a + b) * 0.5f;
+        float d1 = SampleOriented(prof, midpoint, axisVector, point);
+        float d2 = SampleOriented(prof, b, axisVector, point);
+        float best = MathF.Min(MathF.Min(d0, d1), d2);
+
+        float denominator = d0 - 2f * d1 + d2;
+        if (denominator > 1e-9f)
+        {
+            float t = 0.5f - 0.25f * (d2 - d0) / denominator;
+            if (t is > 0f and < 1f)
+                best = MathF.Min(best, SampleOriented(prof, Vector3.Lerp(a, b, t), axisVector, point));
+        }
+
+        return best - prof.Epsilon;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float SampleAt(ToolProfile prof, float ax, float ay, float az, float px, float py, float pz)
     {
         float dx = px - ax, dy = py - ay;
         return prof.Sample(MathF.Sqrt(dx * dx + dy * dy), pz - az);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float SampleOriented(ToolProfile prof, in Vector3 toolTip, in Vector3 axis, in Vector3 point)
+    {
+        Vector3 delta = point - toolTip;
+        float axial = Vector3.Dot(delta, axis);
+        float radialSquared = MathF.Max(0f, delta.LengthSquared() - axial * axial);
+        return prof.Sample(MathF.Sqrt(radialSquared), axial);
     }
 
     /// <summary>

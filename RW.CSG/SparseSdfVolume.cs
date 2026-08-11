@@ -37,9 +37,9 @@ public sealed class SparseSdfVolume
     private int _brickCount;
     private readonly Stack<int> _freeHandles = new();
 
-    /// <summary>Minimum raise before a voxel is rewritten. 0 = exact max. Setting this to about one
+    /// <summary>Minimum raise before a voxel is rewritten. Setting this to about one
     /// Half ULP at band scale (BandWorld/1024) suppresses re-stamp drift caused by Half round-down.</summary>
-    public float WriteEpsilon;
+    public float WriteEpsilon = 1e-7f;
 
     // Coarse whole-volume SDF: 1 cell = 8 voxels regardless of brick size (plan §3).
     public readonly int CoarseX;
@@ -955,5 +955,347 @@ public sealed class SparseSdfVolume
         float x01 = c001 + (c101 - c001) * fu, x11 = c011 + (c111 - c011) * fu;
         float y0 = x00 + (x10 - x00) * fv, y1 = x01 + (x11 - x01) * fv;
         return y0 + (y1 - y0) * fw;
+    }
+
+    // ---- conservative planning probes -----------------------------------
+
+    /// <summary>
+    /// Classifies whether an oriented cutter sweep could remove material without mutating the
+    /// volume. <see cref="RemovalProbeResult.DefinitelyAir"/> is returned only when every
+    /// conservative candidate brick is already air; mixed or unresolved surface cases remain
+    /// <see cref="RemovalProbeResult.Uncertain"/> so a planner cannot silently skip stock.
+    /// </summary>
+    public RemovalProbe ProbeRemoval(in OrientedToolSweep sweep, ToolProfile tool)
+    {
+        ArgumentNullException.ThrowIfNull(tool);
+        GetOrientedSweepBrickRange(sweep, tool, out int x0, out int x1, out int y0, out int y1, out int z0, out int z1);
+        if (x0 > x1 || y0 > y1 || z0 > z1)
+        {
+            return new RemovalProbe(
+                RemovalProbeResult.DefinitelyAir,
+                new RemovalProbeDiagnostics(0, 0, 0, BandWorld, BandWorld));
+        }
+
+        int samples = 0;
+        int materialSamples = 0;
+        int uncertainSamples = 0;
+        float minimumStockDistance = float.MaxValue;
+        float minimumBrushDistance = float.MaxValue;
+        bool encounteredNonAir = false;
+        float contactTolerance = MathF.Max(tool.Epsilon, 0.5f * VoxelSize);
+        float brickWorld = BrickSize * VoxelSize;
+
+        for (int bz = z0; bz <= z1; bz++)
+        {
+            for (int by = y0; by <= y1; by++)
+            {
+                for (int bx = x0; bx <= x1; bx++)
+                {
+                    int brick = BrickId(bx, by, bz);
+                    int state = BrickState(brick);
+                    if (state == Air)
+                        continue;
+
+                    encounteredNonAir = true;
+                    float originX = bx * brickWorld;
+                    float originY = by * brickWorld;
+                    float originZ = bz * brickWorld;
+                    for (int localZ = 0; localZ < BrickSize; localZ++)
+                    {
+                        for (int localY = 0; localY < BrickSize; localY++)
+                        {
+                            for (int localX = 0; localX < BrickSize; localX++)
+                            {
+                                Vector3 point = new(
+                                    originX + (localX + 0.5f) * VoxelSize,
+                                    originY + (localY + 0.5f) * VoxelSize,
+                                    originZ + (localZ + 0.5f) * VoxelSize);
+                                float brushDistance = SweptBrush.EvalOriented(
+                                    tool, sweep.Start, sweep.End, sweep.Axis, point);
+                                if (brushDistance > contactTolerance)
+                                    continue;
+
+                                float stockDistance = GetVoxel(
+                                    bx * BrickSize + localX,
+                                    by * BrickSize + localY,
+                                    bz * BrickSize + localZ);
+                                samples++;
+                                minimumStockDistance = MathF.Min(minimumStockDistance, stockDistance);
+                                minimumBrushDistance = MathF.Min(minimumBrushDistance, brushDistance);
+
+                                if (stockDistance < -contactTolerance && brushDistance < -contactTolerance)
+                                {
+                                    materialSamples++;
+                                }
+                                else if (stockDistance <= contactTolerance)
+                                {
+                                    uncertainSamples++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        RemovalProbeResult result = materialSamples > 0
+            ? RemovalProbeResult.IntersectsMaterial
+            : encounteredNonAir
+                ? RemovalProbeResult.Uncertain
+                : RemovalProbeResult.DefinitelyAir;
+        if (minimumStockDistance == float.MaxValue)
+            minimumStockDistance = BandWorld;
+        if (minimumBrushDistance == float.MaxValue)
+            minimumBrushDistance = BandWorld;
+
+        return new RemovalProbe(
+            result,
+            new RemovalProbeDiagnostics(
+                samples,
+                materialSamples,
+                uncertainSamples,
+                minimumStockDistance,
+                minimumBrushDistance));
+    }
+
+    /// <summary>
+    /// Measures the exact volume a sequence of oriented sweeps would remove without mutating
+    /// this volume. Callers can use <see cref="IsSweepDefinitelyAir"/> first to avoid cloning
+    /// known-empty work.
+    /// </summary>
+    public RemovalVolumeProbe ProbeRemovalVolume(
+        IReadOnlyList<OrientedToolSweep> sweeps,
+        ToolProfile tool)
+    {
+        ArgumentNullException.ThrowIfNull(sweeps);
+        ArgumentNullException.ThrowIfNull(tool);
+
+        bool definitelyAir = true;
+        foreach (OrientedToolSweep sweep in sweeps)
+        {
+            if (!IsSweepDefinitelyAir(sweep, tool))
+            {
+                definitelyAir = false;
+                break;
+            }
+        }
+
+        if (definitelyAir)
+            return new RemovalVolumeProbe(DefinitelyAir: true, RemovableVolume: 0d);
+
+        SparseSdfVolume probe = DeepClone();
+        double removedBefore = probe.RemovedVolume;
+        foreach (OrientedToolSweep sweep in sweeps)
+            probe.StampOriented(sweep, tool);
+
+        return new RemovalVolumeProbe(
+            DefinitelyAir: false,
+            RemovableVolume: probe.RemovedVolume - removedBefore);
+    }
+
+    /// <summary>
+    /// Returns true only if every conservatively affected brick is already air. This is the
+    /// planner's sole safe pruning condition and avoids fine-voxel diagnostics when any stock
+    /// candidate must remain in the toolpath.
+    /// </summary>
+    public bool IsSweepDefinitelyAir(in OrientedToolSweep sweep, ToolProfile tool)
+    {
+        ArgumentNullException.ThrowIfNull(tool);
+        GetOrientedSweepBrickRange(sweep, tool, out int x0, out int x1, out int y0, out int y1, out int z0, out int z1);
+        if (x0 > x1 || y0 > y1 || z0 > z1)
+            return true;
+
+        for (int bz = z0; bz <= z1; bz++)
+        {
+            for (int by = y0; by <= y1; by++)
+            {
+                for (int bx = x0; bx <= x1; bx++)
+                {
+                    if (BrickState(BrickId(bx, by, bz)) != Air)
+                        return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Subtracts a sweep whose profile axis is aligned to a signed stock axis. The established
+    /// +Z path retains the optimized batch stamper; other faces use the same monotone SDF update
+    /// with a conservative per-voxel fallback.
+    /// </summary>
+    public void StampOriented(in OrientedToolSweep sweep, ToolProfile tool)
+    {
+        ArgumentNullException.ThrowIfNull(tool);
+        if (sweep.Axis == ToolAxisDirection.PositiveZ)
+        {
+            PathSegment[] segments = [new PathSegment(sweep.Start, sweep.End)];
+            StampBatch(segments, 0, segments.Length, tool, parallel: false, conservativeCull: true);
+            return;
+        }
+
+        GetOrientedSweepBrickRange(sweep, tool, out int x0, out int x1, out int y0, out int y1, out int z0, out int z1);
+        DirtyBricks.Clear();
+        if (x0 > x1 || y0 > y1 || z0 > z1)
+            return;
+
+        float brickWorld = BrickSize * VoxelSize;
+        float inverseVoxel = 1f / VoxelSize;
+        double removed = 0;
+        for (int bz = z0; bz <= z1; bz++)
+        {
+            for (int by = y0; by <= y1; by++)
+            {
+                for (int bx = x0; bx <= x1; bx++)
+                {
+                    removed += StampOrientedBrick(
+                        BrickId(bx, by, bz),
+                        bx * brickWorld,
+                        by * brickWorld,
+                        bz * brickWorld,
+                        sweep,
+                        tool,
+                        inverseVoxel);
+                }
+            }
+        }
+
+        RemovedVolume += removed;
+        ExpandDirtyToFaceNeighbors();
+        if (CoarseEnabled)
+            RebuildCoarseFromBrickStates();
+    }
+
+    private void GetOrientedSweepBrickRange(
+        in OrientedToolSweep sweep,
+        ToolProfile tool,
+        out int x0,
+        out int x1,
+        out int y0,
+        out int y1,
+        out int z0,
+        out int z1)
+    {
+        float extent = tool.BallRadius + BandWorld + tool.Epsilon;
+        Vector3 minimum = Vector3.Min(sweep.Start, sweep.End) - new Vector3(extent);
+        Vector3 maximum = Vector3.Max(sweep.Start, sweep.End) + new Vector3(extent);
+        float brickWorld = BrickSize * VoxelSize;
+        int maximumStockBrickZ = Math.Clamp(
+            (int)MathF.Ceiling(StockHeight / brickWorld) - 1,
+            0,
+            BricksZ - 1);
+
+        if (maximum.X < 0f || maximum.Y < 0f || maximum.Z < 0f
+            || minimum.X >= StockSizeX || minimum.Y >= StockSizeY || minimum.Z >= StockHeight)
+        {
+            x0 = y0 = z0 = 0;
+            x1 = y1 = z1 = -1;
+            return;
+        }
+
+        x0 = Math.Clamp((int)MathF.Floor(minimum.X / brickWorld), 0, BricksX - 1);
+        x1 = Math.Clamp((int)MathF.Floor(maximum.X / brickWorld), 0, BricksX - 1);
+        y0 = Math.Clamp((int)MathF.Floor(minimum.Y / brickWorld), 0, BricksY - 1);
+        y1 = Math.Clamp((int)MathF.Floor(maximum.Y / brickWorld), 0, BricksY - 1);
+        z0 = Math.Clamp((int)MathF.Floor(minimum.Z / brickWorld), 0, maximumStockBrickZ);
+        z1 = Math.Clamp((int)MathF.Floor(maximum.Z / brickWorld), 0, maximumStockBrickZ);
+    }
+
+    private double StampOrientedBrick(
+        int brick,
+        float originX,
+        float originY,
+        float originZ,
+        in OrientedToolSweep sweep,
+        ToolProfile tool,
+        float inverseVoxel)
+    {
+        int state = BrickState(brick);
+        if (state == Air)
+            return 0;
+
+        float[] scratch = _scratch ??= new float[16 * 16 * 16];
+        LoadScratch(state, scratch);
+        bool changed = false;
+        byte faceMask = 0;
+        double removed = 0;
+        float voxelVolume = VoxelSize * VoxelSize * VoxelSize;
+        int voxelIndex = 0;
+        for (int localZ = 0; localZ < BrickSize; localZ++)
+        {
+            float z = originZ + (localZ + 0.5f) * VoxelSize;
+            for (int localY = 0; localY < BrickSize; localY++)
+            {
+                float y = originY + (localY + 0.5f) * VoxelSize;
+                for (int localX = 0; localX < BrickSize; localX++, voxelIndex++)
+                {
+                    float x = originX + (localX + 0.5f) * VoxelSize;
+                    float current = scratch[voxelIndex];
+                    if (current >= BandWorld)
+                        continue;
+
+                    float brushDistance = SweptBrush.EvalOriented(
+                        tool,
+                        sweep.Start,
+                        sweep.End,
+                        sweep.Axis,
+                        new Vector3(x, y, z));
+                    float next = MathF.Min(BandWorld, -brushDistance);
+                    if (next <= current + WriteEpsilon)
+                        continue;
+
+                    removed += (Occ(current, inverseVoxel) - Occ(next, inverseVoxel)) * voxelVolume;
+                    scratch[voxelIndex] = next;
+                    if (localX == 0) faceMask |= FaceNegX;
+                    else if (localX == BrickSize - 1) faceMask |= FacePosX;
+                    if (localY == 0) faceMask |= FaceNegY;
+                    else if (localY == BrickSize - 1) faceMask |= FacePosY;
+                    if (localZ == 0) faceMask |= FaceNegZ;
+                    else if (localZ == BrickSize - 1) faceMask |= FacePosZ;
+                    changed = true;
+                }
+            }
+        }
+
+        if (!changed)
+            return 0;
+
+        float minimum = float.MaxValue;
+        float maximum = float.MinValue;
+        for (int index = 0; index < BrickVoxels; index++)
+        {
+            minimum = MathF.Min(minimum, scratch[index]);
+            maximum = MathF.Max(maximum, scratch[index]);
+        }
+
+        int nextState = minimum >= BandWorld - 1e-6f
+            ? Air
+            : maximum <= -BandWorld + 1e-6f
+                ? Solid
+                : int.MaxValue;
+        lock (_slabs)
+        {
+            int previousState = _brickIndex[brick];
+            if (nextState == int.MaxValue)
+            {
+                int handle = previousState >= 0 ? previousState : AllocHandle();
+                _brickIndex[brick] = handle;
+                Span<Half> destination = BrickData(handle);
+                for (int index = 0; index < BrickVoxels; index++)
+                    destination[index] = (Half)scratch[index];
+            }
+            else
+            {
+                if (previousState >= 0)
+                    FreeHandle(previousState);
+                _brickIndex[brick] = nextState;
+            }
+
+            DirtyBricks.Add(brick);
+            _dirtyFaceMask[brick] = faceMask;
+        }
+
+        return removed;
     }
 }
