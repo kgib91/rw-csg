@@ -1059,16 +1059,19 @@ public sealed class SparseSdfVolume
     }
 
     /// <summary>
-    /// Measures the exact volume a sequence of oriented sweeps would remove without mutating
-    /// this volume. Callers can use <see cref="IsSweepDefinitelyAir"/> first to avoid cloning
-    /// known-empty work.
+    /// Measures the exact volume a sequence of oriented sweeps would remove from the current
+    /// stock and the incremental volume the same path removes from virgin stock between its
+    /// previous and current pass depths, without mutating this volume.
     /// </summary>
     public RemovalVolumeProbe ProbeRemovalVolume(
         IReadOnlyList<OrientedToolSweep> sweeps,
-        ToolProfile tool)
+        ToolProfile tool,
+        float activeAxialHeight)
     {
         ArgumentNullException.ThrowIfNull(sweeps);
         ArgumentNullException.ThrowIfNull(tool);
+        if (!float.IsFinite(activeAxialHeight) || activeAxialHeight <= 0f)
+            throw new ArgumentOutOfRangeException(nameof(activeAxialHeight));
 
         bool definitelyAir = true;
         foreach (OrientedToolSweep sweep in sweeps)
@@ -1081,16 +1084,46 @@ public sealed class SparseSdfVolume
         }
 
         if (definitelyAir)
-            return new RemovalVolumeProbe(DefinitelyAir: true, RemovableVolume: 0d);
+        {
+            return new RemovalVolumeProbe(
+                DefinitelyAir: true,
+                RemovableVolume: 0d,
+                FullStockRemovableVolume: 0d);
+        }
 
         SparseSdfVolume probe = DeepClone();
         double removedBefore = probe.RemovedVolume;
         foreach (OrientedToolSweep sweep in sweeps)
             probe.StampOriented(sweep, tool);
 
+        var fullStockProbe = new SparseSdfVolume(
+            VoxelsX,
+            VoxelsY,
+            VoxelsZ,
+            VoxelSize,
+            BrickSize,
+            BandVoxels,
+            StockHeight)
+        {
+            WriteEpsilon = WriteEpsilon,
+            CoarseEnabled = false
+        };
+        foreach (OrientedToolSweep sweep in sweeps)
+        {
+            Vector3 offset = sweep.Axis.ToVector() * activeAxialHeight;
+            fullStockProbe.StampOriented(
+                new OrientedToolSweep(sweep.Start + offset, sweep.End + offset, sweep.Axis),
+                tool);
+        }
+
+        double fullStockRemovedBefore = fullStockProbe.RemovedVolume;
+        foreach (OrientedToolSweep sweep in sweeps)
+            fullStockProbe.StampOriented(sweep, tool);
+
         return new RemovalVolumeProbe(
             DefinitelyAir: false,
-            RemovableVolume: probe.RemovedVolume - removedBefore);
+            RemovableVolume: probe.RemovedVolume - removedBefore,
+            FullStockRemovableVolume: fullStockProbe.RemovedVolume - fullStockRemovedBefore);
     }
 
     /// <summary>
@@ -1177,9 +1210,18 @@ public sealed class SparseSdfVolume
         out int z0,
         out int z1)
     {
-        float extent = tool.BallRadius + BandWorld + tool.Epsilon;
-        Vector3 minimum = Vector3.Min(sweep.Start, sweep.End) - new Vector3(extent);
-        Vector3 maximum = Vector3.Max(sweep.Start, sweep.End) + new Vector3(extent);
+        Vector3 axis = sweep.Axis.ToVector();
+        Vector3 firstAxialExtent = axis * tool.Zmin;
+        Vector3 secondAxialExtent = axis * tool.Zmax;
+        Vector3 minimumAxialExtent = Vector3.Min(firstAxialExtent, secondAxialExtent);
+        Vector3 maximumAxialExtent = Vector3.Max(firstAxialExtent, secondAxialExtent);
+        Vector3 radialExtent = new(
+            axis.X == 0f ? tool.Rmax : 0f,
+            axis.Y == 0f ? tool.Rmax : 0f,
+            axis.Z == 0f ? tool.Rmax : 0f);
+        Vector3 influence = radialExtent + new Vector3(BandWorld + tool.Epsilon);
+        Vector3 minimum = Vector3.Min(sweep.Start, sweep.End) + minimumAxialExtent - influence;
+        Vector3 maximum = Vector3.Max(sweep.Start, sweep.End) + maximumAxialExtent + influence;
         float brickWorld = BrickSize * VoxelSize;
         int maximumStockBrickZ = Math.Clamp(
             (int)MathF.Ceiling(StockHeight / brickWorld) - 1,

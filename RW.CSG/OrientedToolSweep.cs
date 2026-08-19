@@ -65,8 +65,17 @@ public readonly record struct RemovalProbe(
     RemovalProbeDiagnostics Diagnostics);
 
 /// <summary>
-/// Exact removable volume measured without changing the source stock volume.
+/// Removable volume in the current stock and in one incremental depth band of the original stock
+/// envelope, measured without changing the source volume.
 /// </summary>
 public readonly record struct RemovalVolumeProbe(
     bool DefinitelyAir,
-    double RemovableVolume);
+    double RemovableVolume,
+    double FullStockRemovableVolume)
+{
+    public bool IsEngagementMeasured => FullStockRemovableVolume > 1e-9;
+
+    public double EngagementPercent => IsEngagementMeasured
+        ? Math.Clamp(RemovableVolume * 100d / FullStockRemovableVolume, 0d, 100d)
+        : 0d;
+}
