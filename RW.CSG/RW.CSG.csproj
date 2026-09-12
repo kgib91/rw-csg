@@ -4,6 +4,10 @@
     <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Stock preview evaluates physical cutter distances millions of times. Keep
+         optimization enabled during interactive Debug QA, with symbols and logs;
+         /p:Optimize=false remains available for instruction-level debugging. -->
+    <Optimize>true</Optimize>
   </PropertyGroup>
 
 </Project>

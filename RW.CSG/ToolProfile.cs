@@ -3,7 +3,8 @@ using System.Numerics;
 namespace RW.CSG;
 
 /// <summary>
-/// Revolved tool profile baked to a signed-distance LUT over the (r,z) half-plane.
+/// Revolved tool profile over the (r,z) half-plane. Physical primitive stacks use
+/// prepared analytic distances; legacy polygons retain the signed-distance LUT.
 /// The polygon is stored MIRRORED across the axis (x in [-Rmax,+Rmax]) so the 2D polygon SDF
 /// sampled at (r>=0, z) is the EXACT 3D SDF of the solid of revolution (nearest point on a
 /// surface of revolution lies in the meridian plane of the query point).
@@ -16,7 +17,7 @@ public sealed class ToolProfile
     public readonly float Rmax, Zmin, Zmax;
     public readonly float Z0;             // z of LUT row 0
     public readonly float CellR, CellZ, InvCellR, InvCellZ;
-    public readonly float Epsilon;        // half LUT cell: subtracted to avoid bilinear overestimation
+    public readonly float Epsilon;        // Legacy polygon LUT reserve; zero for analytic physical stacks.
     public readonly float Pad;            // LUT domain margin beyond tool bounds
     public readonly float BallRadius;     // bounding sphere of the tool, centered on axis at BallCenterZ
     public readonly float BallCenterZ;
@@ -33,6 +34,7 @@ public sealed class ToolProfile
 
     private readonly Vector2[]? _poly;    // mirrored closed polygon (for exact reference evals)
     private readonly bool[] _monotoneRows;
+    private readonly PreparedSweptVolumeSdf? _preparedStack;
 
     public ToolProfile(Vector2[] mirroredPolygon, int lutSize, float pad)
         : this(mirroredPolygon, null, lutSize, lutSize, pad)
@@ -40,8 +42,8 @@ public sealed class ToolProfile
     }
 
     /// <summary>
-    /// Bake an exact stacked-primitive profile. Separate radial/axial dimensions keep a long,
-    /// slender machine tool accurate without wasting a square 1024² LUT.
+    /// Prepare exact physical-stack sampling. Separate radial/axial dimensions keep a long,
+    /// slender tool compact when baking the auxiliary LUT used for radial-monotonicity checks.
     /// </summary>
     public ToolProfile(SweptVolumeStack stack, int radialLutSize = 256,
         int axialLutSize = 256, float pad = 2f)
@@ -62,6 +64,7 @@ public sealed class ToolProfile
 
         _poly = mirroredPolygon;
         ProfileStack = stack is null ? null : new SweptVolumeStack(stack.Segments);
+        _preparedStack = ProfileStack is null ? null : new PreparedSweptVolumeSdf(ProfileStack);
         LutWidth = lutWidth;
         LutHeight = lutHeight;
         Pad = pad;
@@ -93,7 +96,7 @@ public sealed class ToolProfile
         CellZ = domZ / (lutHeight - 1);
         InvCellR = 1f / CellR;
         InvCellZ = 1f / CellZ;
-        Epsilon = 0.5f * MathF.Max(CellR, CellZ);
+        Epsilon = ProfileStack is null ? 0.5f * MathF.Max(CellR, CellZ) : 0f;
 
         Lut = new float[lutWidth * lutHeight];
         for (int j = 0; j < lutHeight; j++)
@@ -159,10 +162,11 @@ public sealed class ToolProfile
         return s * MathF.Sqrt(d);
     }
 
-    /// <summary>Bilinear LUT sample at radius r (>=0) and height z. Clamped at domain edges
+    /// <summary>Physical stacks use analytic sampling. Legacy polygon LUT values are clamped at domain edges
     /// (out-of-domain values saturate near +Pad, i.e. "far air" — safe: no material change).</summary>
     public float Sample(float r, float z)
     {
+        if (_preparedStack is not null) return _preparedStack.Evaluate(r, z);
         float u = r * InvCellR;
         float v = (z - Z0) * InvCellZ;
         int width = LutWidth, height = LutHeight;
@@ -210,3 +214,8 @@ public sealed class ToolProfile
             new(-shankR, discH), new(-discR, discH),
         ], lutSize, pad);
 }
+
+
+
+
+

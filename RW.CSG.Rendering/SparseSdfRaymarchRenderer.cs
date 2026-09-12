@@ -826,7 +826,7 @@ float voxelAt(ivec3 voxel)
     return texelFetch(uAtlas, tile * 9 + local, 0).r;
 }
 
-float fieldAt(vec3 p)
+float rawFieldAt(vec3 p)
 {
     vec3 q = clamp(p, vec3(0.5 * uVoxel), uVolume - vec3(0.5 * uVoxel));
     vec3 voxelGrid = q / uVoxel - 0.5;
@@ -868,7 +868,105 @@ float fieldAt(vec3 p)
             fraction.z);
     }
 
-    return max(sampled, stockAt(p));
+    return sampled;
+}
+
+float fieldAt(vec3 p)
+{
+    return max(rawFieldAt(p), stockAt(p));
+}
+
+// A forced minimum ray step can cross an entire thin surface at a grazing angle.
+// The stored field is trilinear within each voxel cell, hence cubic along a ray.
+// Split the short step at voxel planes and inspect its derivative extrema before
+// advancing. Only a confirmed negative field sample supplies a crossing bracket;
+// a small positive distance alone never invents a surface.
+bool firstRawCrossing(vec3 origin, vec3 direction, float start, float end,
+    out float outsideT, out float insideT)
+{
+    outsideT = start;
+    insideT = start;
+    float current = start;
+    // A step is at most 0.35 voxel, crossing at most one plane per axis.
+    for (int piece = 0; piece < 5 && current < end; piece++)
+    {
+        vec3 p = origin + direction * current;
+        float boundary = end;
+        for (int axis = 0; axis < 3; axis++)
+        {
+            float d = direction[axis];
+            if (abs(d) < 1e-7)
+                continue;
+            float grid = p[axis] / uVoxel - 0.5;
+            float plane = d > 0.0 ? floor(grid) + 1.0 : ceil(grid) - 1.0;
+            float crossing = ((plane + 0.5) * uVoxel - origin[axis]) / d;
+            if (crossing <= current + 1e-6)
+                crossing += uVoxel / abs(d);
+            boundary = min(boundary, crossing);
+        }
+
+        float span = boundary - current;
+        float f0 = rawFieldAt(origin + direction * current);
+        float f1 = rawFieldAt(origin + direction * (current + span / 3.0));
+        float f2 = rawFieldAt(origin + direction * (current + 2.0 * span / 3.0));
+        float f3 = rawFieldAt(origin + direction * boundary);
+        float d1 = f1 - f0;
+        float d2 = f2 - 2.0 * f1 + f0;
+        float d3 = f3 - 3.0 * f2 + 3.0 * f1 - f0;
+        float c1 = 3.0 * d1 - 1.5 * d2 + d3;
+        float c2 = 4.5 * (d2 - d3);
+        float c3 = 4.5 * d3;
+        float a = 3.0 * c3;
+        float b = 2.0 * c2;
+        float knots[4];
+        knots[0] = 0.0;
+        knots[1] = 1.0;
+        int knotCount = 2;
+        if (abs(a) < 1e-7)
+        {
+            if (abs(b) > 1e-7)
+            {
+                float root = -c1 / b;
+                if (root > 0.0 && root < 1.0)
+                    knots[knotCount++] = root;
+            }
+        }
+        else
+        {
+            float discriminant = b * b - 4.0 * a * c1;
+            if (discriminant >= 0.0)
+            {
+                float squareRoot = sqrt(discriminant);
+                float q = -0.5 * (b + (b >= 0.0 ? squareRoot : -squareRoot));
+                float root1 = q / a;
+                float root2 = q != 0.0 ? c1 / q : -1.0;
+                if (root1 > 0.0 && root1 < 1.0)
+                    knots[knotCount++] = root1;
+                if (root2 > 0.0 && root2 < 1.0)
+                    knots[knotCount++] = root2;
+            }
+        }
+        for (int i = 1; i < knotCount; i++)
+            for (int j = i; j > 0; j--)
+                if (knots[j] < knots[j - 1])
+                {
+                    float temporary = knots[j];
+                    knots[j] = knots[j - 1];
+                    knots[j - 1] = temporary;
+                }
+        for (int i = 1; i < knotCount; i++)
+        {
+            float candidate = current + span * knots[i];
+            if (rawFieldAt(origin + direction * candidate) < 0.0)
+            {
+                outsideT = current + span * knots[i - 1];
+                insideT = candidate;
+                return true;
+            }
+        }
+        current = boundary;
+    }
+    return false;
 }
 
 float surfaceAt(vec3 p)
@@ -977,8 +1075,22 @@ void main()
         }
 
         atStockEntry = false;
+        float nextT = traceT + max(distance, 0.35 * uVoxel);
+        if (distance < 0.35 * uVoxel)
+        {
+            float outsideT;
+            float insideT;
+            if (firstRawCrossing(origin, direction, traceT, min(nextT, stockExit),
+                outsideT, insideT))
+            {
+                previousT = outsideT;
+                traceT = insideT;
+                hit = true;
+                break;
+            }
+        }
         previousT = traceT;
-        traceT += max(distance, 0.35 * uVoxel);
+        traceT = nextT;
     }
 
     if (!hit)
