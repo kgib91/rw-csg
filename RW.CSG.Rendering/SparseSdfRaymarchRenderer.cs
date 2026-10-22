@@ -30,7 +30,7 @@ public static class SparseSdfRaymarchDebugViews
     private static readonly string[] ViewLegends =
     [
         "Shaded material preview",
-        "Blue solid | Green filtered | White raw | Red near miss",
+        "Blue solid | Green filtered | White raw / physical | Red near miss",
         "Blue low cost to cyan to green to yellow to red high cost",
         "Stable pseudo-color per 8x8x8 brick; white marks brick planes",
         "RGB is local XYZ phase inside each voxel; white marks voxel planes",
@@ -740,10 +740,13 @@ public sealed class SparseSdfRaymarchRenderer : IDisposable
         uint program = _gl.CreateProgram();
         _gl.AttachShader(program, vertexShader);
         _gl.AttachShader(program, fragmentShader);
+        var linkWatch = System.Diagnostics.Stopwatch.StartNew();
+        Console.WriteLine("[CsgStock.Shader] stage=link event=start");
         _gl.LinkProgram(program);
         _gl.GetProgram(program, ProgramPropertyARB.LinkStatus, out int linked);
         _gl.DeleteShader(vertexShader);
         _gl.DeleteShader(fragmentShader);
+        Console.WriteLine($"[CsgStock.Shader] stage=link event=complete success={linked != 0} elapsedMs={linkWatch.Elapsed.TotalMilliseconds:F1}");
 
         if (linked == 0)
         {
@@ -757,10 +760,13 @@ public sealed class SparseSdfRaymarchRenderer : IDisposable
 
     private uint CompileShader(ShaderType type, string source)
     {
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Console.WriteLine($"[CsgStock.Shader] stage=compile event=start type={type} characters={source.Length}");
         uint shader = _gl.CreateShader(type);
         _gl.ShaderSource(shader, source);
         _gl.CompileShader(shader);
         _gl.GetShader(shader, ShaderParameterName.CompileStatus, out int compiled);
+        Console.WriteLine($"[CsgStock.Shader] stage=compile event=complete type={type} success={compiled != 0} elapsedMs={watch.Elapsed.TotalMilliseconds:F1}");
         if (compiled != 0)
             return shader;
 

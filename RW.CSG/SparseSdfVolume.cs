@@ -220,7 +220,10 @@ public sealed class SparseSdfVolume
     {
         if (_freeHandles.TryPop(out int h)) return h;
         h = _brickCount++;
-        if (h / SlabBricks >= _slabs.Count) _slabs.Add(new Half[SlabBricks * BrickVoxels]);
+        if (h / SlabBricks >= _slabs.Count)
+        {
+            _slabs.Add(new Half[SlabBricks * BrickVoxels]);
+        }
         return h;
     }
 
@@ -665,7 +668,9 @@ public sealed class SparseSdfVolume
             DirtyBricks.Add(b);
         }
         if (dstSlab is not null) // Half conversion + store outside the lock (owned region, race-free)
+        {
             for (int k = 0; k < BrickVoxels; k++) dstSlab[dstOff + k] = (Half)scratch[k];
+        }
     }
 
     private void StatEngulfsInc() => Interlocked.Add(ref StatEngulfs, 1);
@@ -957,201 +962,6 @@ public sealed class SparseSdfVolume
         return y0 + (y1 - y0) * fw;
     }
 
-    // ---- conservative planning probes -----------------------------------
-
-    /// <summary>
-    /// Classifies whether an oriented cutter sweep could remove material without mutating the
-    /// volume. <see cref="RemovalProbeResult.DefinitelyAir"/> is returned only when every
-    /// conservative candidate brick is already air; mixed or unresolved surface cases remain
-    /// <see cref="RemovalProbeResult.Uncertain"/> so a planner cannot silently skip stock.
-    /// </summary>
-    public RemovalProbe ProbeRemoval(in OrientedToolSweep sweep, ToolProfile tool)
-    {
-        ArgumentNullException.ThrowIfNull(tool);
-        GetOrientedSweepBrickRange(sweep, tool, out int x0, out int x1, out int y0, out int y1, out int z0, out int z1);
-        if (x0 > x1 || y0 > y1 || z0 > z1)
-        {
-            return new RemovalProbe(
-                RemovalProbeResult.DefinitelyAir,
-                new RemovalProbeDiagnostics(0, 0, 0, BandWorld, BandWorld));
-        }
-
-        int samples = 0;
-        int materialSamples = 0;
-        int uncertainSamples = 0;
-        float minimumStockDistance = float.MaxValue;
-        float minimumBrushDistance = float.MaxValue;
-        bool encounteredNonAir = false;
-        float contactTolerance = MathF.Max(tool.Epsilon, 0.5f * VoxelSize);
-        float brickWorld = BrickSize * VoxelSize;
-
-        for (int bz = z0; bz <= z1; bz++)
-        {
-            for (int by = y0; by <= y1; by++)
-            {
-                for (int bx = x0; bx <= x1; bx++)
-                {
-                    int brick = BrickId(bx, by, bz);
-                    int state = BrickState(brick);
-                    if (state == Air)
-                        continue;
-
-                    encounteredNonAir = true;
-                    float originX = bx * brickWorld;
-                    float originY = by * brickWorld;
-                    float originZ = bz * brickWorld;
-                    for (int localZ = 0; localZ < BrickSize; localZ++)
-                    {
-                        for (int localY = 0; localY < BrickSize; localY++)
-                        {
-                            for (int localX = 0; localX < BrickSize; localX++)
-                            {
-                                Vector3 point = new(
-                                    originX + (localX + 0.5f) * VoxelSize,
-                                    originY + (localY + 0.5f) * VoxelSize,
-                                    originZ + (localZ + 0.5f) * VoxelSize);
-                                float brushDistance = SweptBrush.EvalOriented(
-                                    tool, sweep.Start, sweep.End, sweep.Axis, point);
-                                if (brushDistance > contactTolerance)
-                                    continue;
-
-                                float stockDistance = GetVoxel(
-                                    bx * BrickSize + localX,
-                                    by * BrickSize + localY,
-                                    bz * BrickSize + localZ);
-                                samples++;
-                                minimumStockDistance = MathF.Min(minimumStockDistance, stockDistance);
-                                minimumBrushDistance = MathF.Min(minimumBrushDistance, brushDistance);
-
-                                if (stockDistance < -contactTolerance && brushDistance < -contactTolerance)
-                                {
-                                    materialSamples++;
-                                }
-                                else if (stockDistance <= contactTolerance)
-                                {
-                                    uncertainSamples++;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        RemovalProbeResult result = materialSamples > 0
-            ? RemovalProbeResult.IntersectsMaterial
-            : encounteredNonAir
-                ? RemovalProbeResult.Uncertain
-                : RemovalProbeResult.DefinitelyAir;
-        if (minimumStockDistance == float.MaxValue)
-            minimumStockDistance = BandWorld;
-        if (minimumBrushDistance == float.MaxValue)
-            minimumBrushDistance = BandWorld;
-
-        return new RemovalProbe(
-            result,
-            new RemovalProbeDiagnostics(
-                samples,
-                materialSamples,
-                uncertainSamples,
-                minimumStockDistance,
-                minimumBrushDistance));
-    }
-
-    /// <summary>
-    /// Measures the exact volume a sequence of oriented sweeps would remove from the current
-    /// stock and the incremental volume the same path removes from virgin stock between its
-    /// previous and current pass depths, without mutating this volume.
-    /// </summary>
-    public RemovalVolumeProbe ProbeRemovalVolume(
-        IReadOnlyList<OrientedToolSweep> sweeps,
-        ToolProfile tool,
-        float activeAxialHeight)
-    {
-        ArgumentNullException.ThrowIfNull(sweeps);
-        ArgumentNullException.ThrowIfNull(tool);
-        if (!float.IsFinite(activeAxialHeight) || activeAxialHeight <= 0f)
-            throw new ArgumentOutOfRangeException(nameof(activeAxialHeight));
-
-        bool definitelyAir = true;
-        foreach (OrientedToolSweep sweep in sweeps)
-        {
-            if (!IsSweepDefinitelyAir(sweep, tool))
-            {
-                definitelyAir = false;
-                break;
-            }
-        }
-
-        if (definitelyAir)
-        {
-            return new RemovalVolumeProbe(
-                DefinitelyAir: true,
-                RemovableVolume: 0d,
-                FullStockRemovableVolume: 0d);
-        }
-
-        SparseSdfVolume probe = DeepClone();
-        double removedBefore = probe.RemovedVolume;
-        foreach (OrientedToolSweep sweep in sweeps)
-            probe.StampOriented(sweep, tool);
-
-        var fullStockProbe = new SparseSdfVolume(
-            VoxelsX,
-            VoxelsY,
-            VoxelsZ,
-            VoxelSize,
-            BrickSize,
-            BandVoxels,
-            StockHeight)
-        {
-            WriteEpsilon = WriteEpsilon,
-            CoarseEnabled = false
-        };
-        foreach (OrientedToolSweep sweep in sweeps)
-        {
-            Vector3 offset = sweep.Axis.ToVector() * activeAxialHeight;
-            fullStockProbe.StampOriented(
-                new OrientedToolSweep(sweep.Start + offset, sweep.End + offset, sweep.Axis),
-                tool);
-        }
-
-        double fullStockRemovedBefore = fullStockProbe.RemovedVolume;
-        foreach (OrientedToolSweep sweep in sweeps)
-            fullStockProbe.StampOriented(sweep, tool);
-
-        return new RemovalVolumeProbe(
-            DefinitelyAir: false,
-            RemovableVolume: probe.RemovedVolume - removedBefore,
-            FullStockRemovableVolume: fullStockProbe.RemovedVolume - fullStockRemovedBefore);
-    }
-
-    /// <summary>
-    /// Returns true only if every conservatively affected brick is already air. This is the
-    /// planner's sole safe pruning condition and avoids fine-voxel diagnostics when any stock
-    /// candidate must remain in the toolpath.
-    /// </summary>
-    public bool IsSweepDefinitelyAir(in OrientedToolSweep sweep, ToolProfile tool)
-    {
-        ArgumentNullException.ThrowIfNull(tool);
-        GetOrientedSweepBrickRange(sweep, tool, out int x0, out int x1, out int y0, out int y1, out int z0, out int z1);
-        if (x0 > x1 || y0 > y1 || z0 > z1)
-            return true;
-
-        for (int bz = z0; bz <= z1; bz++)
-        {
-            for (int by = y0; by <= y1; by++)
-            {
-                for (int bx = x0; bx <= x1; bx++)
-                {
-                    if (BrickState(BrickId(bx, by, bz)) != Air)
-                        return false;
-                }
-            }
-        }
-
-        return true;
-    }
 
     /// <summary>
     /// Subtracts a sweep whose profile axis is aligned to a signed stock axis. The established
