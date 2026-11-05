@@ -65,7 +65,7 @@ internal sealed unsafe class GlSceneControl : OpenGlControlBase
     private static readonly string[] DebugViewLegends =
     [
         "Shaded material preview",
-        "Blue solid | Green filtered | Orange early-raw | Yellow late-raw | White reversed/thin | Magenta tangent | Red miss | Cyan degenerate",
+        "Blue solid | White stored boundary | Magenta tangent | Red miss | Cyan degenerate",
         "Blue low cost → cyan → green → yellow → red high cost; misses are dim",
         "Stable pseudo-color per shifted 8³ brick; white marks atlas brick planes",
         "RGB = local XYZ phase inside each voxel; white marks voxel planes",
@@ -2252,21 +2252,6 @@ internal sealed unsafe class GlSceneControl : OpenGlControlBase
             return max(sampled, stockAt(p));        // intersection: remaining material ∩ stock
         }
 
-        // A small isotropic reconstruction filter used only after the fast field has found the
-        // surface.  Marching still uses the exact trilinear field; filtering refinement/normals
-        // removes voxel-sized facets without multiplying the cost of every empty-space step.
-        float surfaceAt(vec3 p) {
-            float r = 0.38 * uVox;
-            float tetra = 0.25 * (
-                fieldAt(p + vec3( r,  r,  r)) +
-                fieldAt(p + vec3( r, -r, -r)) +
-                fieldAt(p + vec3(-r,  r, -r)) +
-                fieldAt(p + vec3(-r, -r,  r)));
-            // Keep a center contribution so sub-voxel/thin wall crossings survive the filter.
-            // A pure tetra average erased those crossings and forced raw yellow fallback bands.
-            return mix(fieldAt(p), tetra, 0.65);
-        }
-
         vec3 heatColor(float x) {
             x = clamp(x, 0.0, 1.0);
             return clamp(vec3(
@@ -2494,9 +2479,7 @@ internal sealed unsafe class GlSceneControl : OpenGlControlBase
             bool hit = false;
             bool solidHit = false;
             bool grazingHit = false;
-            bool filteredHit = false;
             bool atStockEntry = true;
-            int filterReject = 0;
             int steps = 0;
             float tPrev = t;
             float closestD = uBand;
@@ -2564,30 +2547,14 @@ internal sealed unsafe class GlSceneControl : OpenGlControlBase
 
             float hitT = t;
             if (!solidHit && !grazingHit) {
-                // First locate the exact trilinear crossing, then refine the locally filtered
-                // crossing in a one-voxel interval. The latter is what removes the staircase
-                // silhouette; falling back to the exact crossing preserves very thin features.
+                // The displayed boundary stays at the first stored-field crossing.
+                // A second averaged-field root erodes sharp retained crests.
                 float lo = tPrev, hi = t;
                 for (int i = 0; i < 7; i++) {
                     float mid = 0.5 * (lo + hi);
                     if (fieldAt(eye + dir * mid) < 0.0) hi = mid; else lo = mid;
                 }
                 hitT = 0.5 * (lo + hi);
-                float slo = max(t0, hitT - uVox);
-                float shi = min(t1, hitT + uVox);
-                float dlo = surfaceAt(eye + dir * slo);
-                float dhi = surfaceAt(eye + dir * shi);
-                if (dlo >= 0.0 && dhi <= 0.0) {
-                    for (int i = 0; i < 6; i++) {
-                        float mid = 0.5 * (slo + shi);
-                        if (surfaceAt(eye + dir * mid) < 0.0) shi = mid; else slo = mid;
-                    }
-                    hitT = 0.5 * (slo + shi);
-                    filteredHit = true;
-                } else {
-                    if (dlo < 0.0) filterReject += 1;  // smoothed crossing moved before interval
-                    if (dhi > 0.0) filterReject += 2;  // crossing moved after/vanished in interval
-                }
             }
             if (toolHit && toolHitT < hitT) {
                 vec3 toolPoint = eye + dir * toolHitT;
@@ -2595,6 +2562,7 @@ internal sealed unsafe class GlSceneControl : OpenGlControlBase
                 return;
             }
             vec3 hp = eye + dir * hitT;
+            // Lighting keeps its existing footprint; geometry stays at the raw root.
             float h = 1.15 * uVox;
             // Uniform SOLID bricks have no atlas samples, but their visible entry surface is
             // the stock boundary. Derive its normal from the same box SDF used by fieldAt;
@@ -2605,9 +2573,9 @@ internal sealed unsafe class GlSceneControl : OpenGlControlBase
                 stockAt(hp + vec3(0, h, 0)) - stockAt(hp - vec3(0, h, 0)),
                 stockAt(hp + vec3(0, 0, h)) - stockAt(hp - vec3(0, 0, h)))
                 : vec3(
-                    surfaceAt(hp + vec3(h, 0, 0)) - surfaceAt(hp - vec3(h, 0, 0)),
-                    surfaceAt(hp + vec3(0, h, 0)) - surfaceAt(hp - vec3(0, h, 0)),
-                    surfaceAt(hp + vec3(0, 0, h)) - surfaceAt(hp - vec3(0, 0, h)));
+                    fieldAt(hp + vec3(h, 0, 0)) - fieldAt(hp - vec3(h, 0, 0)),
+                    fieldAt(hp + vec3(0, h, 0)) - fieldAt(hp - vec3(0, h, 0)),
+                    fieldAt(hp + vec3(0, 0, h)) - fieldAt(hp - vec3(0, 0, h)));
             float gl = length(g);
             vec3 nrm = gl > 1e-6 ? (g / gl) : -dir;
 
@@ -2615,9 +2583,6 @@ internal sealed unsafe class GlSceneControl : OpenGlControlBase
                 vec3 diagnostic = solidHit ? vec3(0.10, 0.38, 1.00)
                     : grazingHit ? vec3(1.00, 0.00, 0.85)
                     : gl <= 1e-6 ? vec3(0.00, 1.00, 1.00)
-                    : filteredHit ? vec3(0.05, 0.95, 0.30)
-                    : filterReject == 1 ? vec3(1.00, 0.35, 0.00)
-                    : filterReject == 2 ? vec3(1.00, 0.78, 0.00)
                     : vec3(1.00);
                 o = vec4(diagnostic, 1.0);
                 return;

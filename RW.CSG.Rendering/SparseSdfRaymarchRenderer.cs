@@ -30,7 +30,7 @@ public static class SparseSdfRaymarchDebugViews
     private static readonly string[] ViewLegends =
     [
         "Shaded material preview",
-        "Blue solid | Green filtered | White raw / physical | Red near miss",
+        "Blue solid | White stored boundary | Magenta grazing | Red near miss | Cyan degenerate",
         "Blue low cost to cyan to green to yellow to red high cost",
         "Stable pseudo-color per 8x8x8 brick; white marks brick planes",
         "RGB is local XYZ phase inside each voxel; white marks voxel planes",
@@ -975,17 +975,6 @@ bool firstRawCrossing(vec3 origin, vec3 direction, float start, float end,
     return false;
 }
 
-float surfaceAt(vec3 p)
-{
-    float radius = 0.38 * uVoxel;
-    float tetrahedralAverage = 0.25 * (
-        fieldAt(p + vec3( radius,  radius,  radius)) +
-        fieldAt(p + vec3( radius, -radius, -radius)) +
-        fieldAt(p + vec3(-radius,  radius, -radius)) +
-        fieldAt(p + vec3(-radius, -radius,  radius)));
-    return mix(fieldAt(p), tetrahedralAverage, 0.65);
-}
-
 bool isUniformSolidAt(vec3 p)
 {
     vec3 q = clamp(p, vec3(0.5 * uVoxel), uVolume - vec3(0.5 * uVoxel));
@@ -1045,9 +1034,7 @@ void main()
     bool hit = false;
     bool solidHit = false;
     bool grazingHit = false;
-    bool filteredHit = false;
     bool atStockEntry = true;
-    int filterReject = 0;
     int steps = 0;
     float closestDistance = uBand;
     float closestT = traceT;
@@ -1151,33 +1138,13 @@ void main()
         }
         hitT = 0.5 * (lo + hi);
 
-        float smoothLo = max(stockEntry, hitT - uVoxel);
-        float smoothHi = min(stockExit, hitT + uVoxel);
-        float smoothLoDistance = surfaceAt(origin + direction * smoothLo);
-        float smoothHiDistance = surfaceAt(origin + direction * smoothHi);
-        if (smoothLoDistance >= 0.0 && smoothHiDistance <= 0.0)
-        {
-            for (int refinement = 0; refinement < 6; refinement++)
-            {
-                float mid = 0.5 * (smoothLo + smoothHi);
-                if (surfaceAt(origin + direction * mid) < 0.0)
-                    smoothHi = mid;
-                else
-                    smoothLo = mid;
-            }
-            hitT = 0.5 * (smoothLo + smoothHi);
-            filteredHit = true;
-        }
-        else
-        {
-            if (smoothLoDistance < 0.0)
-                filterReject += 1;
-            if (smoothHiDistance > 0.0)
-                filterReject += 2;
-        }
+        // Keep the first stored-field crossing. Averaging neighboring samples
+        // and solving a second root erodes sharp retained crests and moves depth.
     }
 
     vec3 hitPoint = origin + direction * hitT;
+    // Retain the established normal footprint for stable shading. It samples
+    // the original field and never changes hit position or fragment depth.
     float normalStep = max(1.15 * uVoxel, 0.02);
     vec3 gradient = solidHit
         ? vec3(
@@ -1185,9 +1152,9 @@ void main()
             stockAt(hitPoint + vec3(0.0, normalStep, 0.0)) - stockAt(hitPoint - vec3(0.0, normalStep, 0.0)),
             stockAt(hitPoint + vec3(0.0, 0.0, normalStep)) - stockAt(hitPoint - vec3(0.0, 0.0, normalStep)))
         : vec3(
-            surfaceAt(hitPoint + vec3(normalStep, 0.0, 0.0)) - surfaceAt(hitPoint - vec3(normalStep, 0.0, 0.0)),
-            surfaceAt(hitPoint + vec3(0.0, normalStep, 0.0)) - surfaceAt(hitPoint - vec3(0.0, normalStep, 0.0)),
-            surfaceAt(hitPoint + vec3(0.0, 0.0, normalStep)) - surfaceAt(hitPoint - vec3(0.0, 0.0, normalStep)));
+            fieldAt(hitPoint + vec3(normalStep, 0.0, 0.0)) - fieldAt(hitPoint - vec3(normalStep, 0.0, 0.0)),
+            fieldAt(hitPoint + vec3(0.0, normalStep, 0.0)) - fieldAt(hitPoint - vec3(0.0, normalStep, 0.0)),
+            fieldAt(hitPoint + vec3(0.0, 0.0, normalStep)) - fieldAt(hitPoint - vec3(0.0, 0.0, normalStep)));
     vec3 normal = length(gradient) > 1e-6 ? normalize(gradient) : -direction;
     vec3 color;
 
@@ -1196,9 +1163,6 @@ void main()
         color = solidHit ? vec3(0.10, 0.38, 1.00)
             : grazingHit ? vec3(1.00, 0.00, 0.85)
             : length(gradient) <= 1e-6 ? vec3(0.00, 1.00, 1.00)
-            : filteredHit ? vec3(0.05, 0.95, 0.30)
-            : filterReject == 1 ? vec3(1.00, 0.35, 0.00)
-            : filterReject == 2 ? vec3(1.00, 0.78, 0.00)
             : vec3(1.00);
     }
     else if (uDebugView == 2)

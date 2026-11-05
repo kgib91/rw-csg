@@ -15,4 +15,10 @@
     <ProjectReference Include="..\RW.CSG\RW.CSG.csproj" />
   </ItemGroup>
 
+
+  <ItemGroup>
+    <!-- Opt-in namespace logging; handlers skip disabled diagnostic interpolation. -->
+    <Using Include="RW.Diagnostics.DiagnosticConsole" Alias="Console" />
+  </ItemGroup>
+
 </Project>

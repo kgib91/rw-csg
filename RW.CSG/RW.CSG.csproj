@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFrameworks>net8.0;net9.0</TargetFrameworks>
@@ -9,5 +9,11 @@
          /p:Optimize=false remains available for instruction-level debugging. -->
     <Optimize>true</Optimize>
   </PropertyGroup>
+
+
+  <ItemGroup>
+    <!-- Shared namespace logging is also available to dependent projects. -->
+    <ProjectReference Include="../RW.Diagnostics/RW.Diagnostics.csproj" />
+  </ItemGroup>
 
 </Project>

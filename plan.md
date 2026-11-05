@@ -1,11 +1,12 @@
 # RW.CSG — Real-Time Material Removal: Architecture Plan
 
-**Status: PHASE 0 COMPLETE — every part proven individually; integration next.**
-All Phase-0 gates passed on the reference machine (benches B1–B4 plus nine concern-specific
-PoCs; two external review rounds adjudicated with measurements, §10/§10b). The measured
-baselines form the performance contract in §12; Phases 1–3 assemble only proven parts along
-the integration pipeline in §12b, each step with its own mini-gate. PoC-hardened library
-primitives already live in `RW.CSG` (see §13).
+**Status: Phases 0–3 delivered; Phase 4 polish and its final GUI gate remain open.**
+Phase-0 gates passed on the reference machine (benches B1–B4 plus nine concern-specific
+PoCs; two external review rounds adjudicated with measurements, §10/§10b). The library
+core, static renderer, and live pipeline are implemented with the recorded gates in §13.
+The measured baselines remain the performance contract in §12, and §12b records the
+integration sequence. Phase 4 still needs the uninterrupted 60-second GUI run described
+in §13; Phase 5 remains optional and unscheduled.
 This document is the single source of truth for the design. Update it when decisions change.
 
 ---
